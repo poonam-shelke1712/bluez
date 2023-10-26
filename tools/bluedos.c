@@ -32,6 +32,12 @@
 #include "lib/hci_lib.h"
 #include "lib/l2cap.h"
 #include "src/oui.h"
+
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+#define LE_LINK		0x80
 #define for_each_opt(opt, long, short) while ((opt=getopt_long(argc, argv, short ? short:"+", long, NULL)) != -1)
 
 /* Defaults */
@@ -54,6 +60,8 @@ static int iteration_count = 0 ;
 /* Stats */
 static int sent_pkt = 0;
 static int recv_pkt = 0;
+
+static volatile int signal_received = 0;
 
 static float tv2fl(struct timeval tv)
 {
@@ -335,51 +343,118 @@ static void connection(char *svr){
 }
 
 
-/*---------------------------------------------hcitool attacks--------------------------------------------------------------------*/
+/*---------------------------------------------hcitool attacks--------------------------------------------------------------------------------------*/
 
-/*------------------------------------------------name--------------------------------------------------------------------------------------*/
-static struct option name_options[] = {
-	{ "help",	0, 0, 'h' },
-	{ 0, 0, 0, 0 }
-};
+/*------------------------------------------------name----------------------------------------------------------------------------------------------*/
 
 
-static void hcitool_name(int dev_id, int argc, char **argv){
-	
-	bdaddr_t bdaddr;
-	char name[248];
-	int opt, dd;
-	printf("i am in name");
+static int str2buf(const char *str, uint8_t *buf, size_t blen)
+{
+	int i, dlen;
 
-	// for_each_opt(opt, name_options, NULL) {
-	// 	switch (opt) {
-	// 	default:
-	// 		printf("%s", name_help);
-	// 		return;
-	// 	}
-	// }
-	//helper_arg(1, 1, &argc, &argv, name_help);
+	if (str == NULL)
+		return -EINVAL;
 
-	str2ba(argv[0], &bdaddr);
+	memset(buf, 0, blen);
 
-	if (dev_id < 0) {
-		dev_id = hci_get_route(&bdaddr);
-		if (dev_id < 0) {
-			fprintf(stderr, "Device is not available.\n");
-			exit(1);
-		}
-	}
+	dlen = MIN((strlen(str) / 2), blen);
 
-	dd = hci_open_dev(dev_id);
-	if (dd < 0) {
-		perror("HCI device open failed");
+	for (i = 0; i < dlen; i++)
+		sscanf(str + (i * 2), "%02hhX", &buf[i]);
+
+	return 0;
+}
+
+static int dev_info(int s, int dev_id, long arg)
+{
+	struct hci_dev_info di = { .dev_id = dev_id };
+	char addr[18];
+
+	if (ioctl(s, HCIGETDEVINFO, (void *) &di))
+		return 0;
+
+	ba2str(&di.bdaddr, addr);
+	printf("\t%s\t%s\n", di.name, addr);
+	return 0;
+}
+
+static void helper_arg(int min_num_arg, int max_num_arg, int *argc,
+			char ***argv, const char *usage)
+{
+	*argc -= optind;
+	/* too many arguments, but when "max_num_arg < min_num_arg" then no
+		 limiting (prefer "max_num_arg=-1" to gen infinity)
+	*/
+	if ( (*argc > max_num_arg) && (max_num_arg >= min_num_arg ) ) {
+		fprintf(stderr, "%s: too many arguments (maximal: %i)\n",
+				*argv[0], max_num_arg);
+		printf("%s", usage);
 		exit(1);
 	}
 
-	if (hci_read_remote_name(dd, &bdaddr, sizeof(name), name, 25000) == 0)
-		printf("%s\n", name);
+	/* print usage */
+	if (*argc < min_num_arg) {
+		fprintf(stderr, "%s: too few arguments (minimal: %i)\n",
+				*argv[0], min_num_arg);
+		printf("%s", usage);
+		exit(0);
+	}
 
-	hci_close_dev(dd);
+	*argv += optind;
+}
+
+static char *type2str(uint8_t type)
+{
+	switch (type) {
+	case SCO_LINK:
+		return "SCO";
+	case ACL_LINK:
+		return "ACL";
+	case ESCO_LINK:
+		return "eSCO";
+	case LE_LINK:
+		return "LE";
+	default:
+		return "Unknown";
+	}
+}
+
+static int conn_list(int s, int dev_id, long arg)
+{
+	struct hci_conn_list_req *cl;
+	struct hci_conn_info *ci;
+	int id = arg;
+	int i;
+
+	if (id != -1 && dev_id != id)
+		return 0;
+
+	if (!(cl = malloc(10 * sizeof(*ci) + sizeof(*cl)))) {
+		perror("Can't allocate memory");
+		exit(1);
+	}
+	cl->dev_id = dev_id;
+	cl->conn_num = 10;
+	ci = cl->conn_info;
+
+	if (ioctl(s, HCIGETCONNLIST, (void *) cl)) {
+		perror("Can't get connection list");
+		exit(1);
+	}
+
+	for (i = 0; i < cl->conn_num; i++, ci++) {
+		char addr[18];
+		char *str;
+		ba2str(&ci->bdaddr, addr);
+		str = hci_lmtostr(ci->link_mode);
+		printf("\t%s %s %s handle %d state %d lm %s\n",
+			ci->out ? "<" : ">", type2str(ci->type),
+			addr, ci->handle, ci->state, str);
+		bt_free(str);
+	}
+
+	free(cl);
+	return 0;
 }
 
 static int find_conn(int s, int dev_id, long arg)
@@ -411,15 +486,298 @@ static int find_conn(int s, int dev_id, long arg)
 	return 0;
 }
 
-/*-----------------------------------------------------------------info------------------------------------------------------*/
+static void hex_dump(char *pref, int width, unsigned char *buf, int len)
+{
+	register int i,n;
+
+	for (i = 0, n = 1; i < len; i++, n++) {
+		if (n == 1)
+			printf("%s", pref);
+		printf("%2.2X ", buf[i]);
+		if (n == width) {
+			printf("\n");
+			n = 0;
+		}
+	}
+	if (i && n!=1)
+		printf("\n");
+}
+
+static char *get_minor_device_name(int major, int minor)
+{
+	switch (major) {
+	case 0:	/* misc */
+		return "";
+	case 1:	/* computer */
+		switch (minor) {
+		case 0:
+			return "Uncategorized";
+		case 1:
+			return "Desktop workstation";
+		case 2:
+			return "Server";
+		case 3:
+			return "Laptop";
+		case 4:
+			return "Handheld";
+		case 5:
+			return "Palm";
+		case 6:
+			return "Wearable";
+		}
+		break;
+	case 2:	/* phone */
+		switch (minor) {
+		case 0:
+			return "Uncategorized";
+		case 1:
+			return "Cellular";
+		case 2:
+			return "Cordless";
+		case 3:
+			return "Smart phone";
+		case 4:
+			return "Wired modem or voice gateway";
+		case 5:
+			return "Common ISDN Access";
+		case 6:
+			return "Sim Card Reader";
+		}
+		break;
+	case 3:	/* lan access */
+		if (minor == 0)
+			return "Uncategorized";
+		switch (minor / 8) {
+		case 0:
+			return "Fully available";
+		case 1:
+			return "1-17% utilized";
+		case 2:
+			return "17-33% utilized";
+		case 3:
+			return "33-50% utilized";
+		case 4:
+			return "50-67% utilized";
+		case 5:
+			return "67-83% utilized";
+		case 6:
+			return "83-99% utilized";
+		case 7:
+			return "No service available";
+		}
+		break;
+	case 4:	/* audio/video */
+		switch (minor) {
+		case 0:
+			return "Uncategorized";
+		case 1:
+			return "Device conforms to the Headset profile";
+		case 2:
+			return "Hands-free";
+			/* 3 is reserved */
+		case 4:
+			return "Microphone";
+		case 5:
+			return "Loudspeaker";
+		case 6:
+			return "Headphones";
+		case 7:
+			return "Portable Audio";
+		case 8:
+			return "Car Audio";
+		case 9:
+			return "Set-top box";
+		case 10:
+			return "HiFi Audio Device";
+		case 11:
+			return "VCR";
+		case 12:
+			return "Video Camera";
+		case 13:
+			return "Camcorder";
+		case 14:
+			return "Video Monitor";
+		case 15:
+			return "Video Display and Loudspeaker";
+		case 16:
+			return "Video Conferencing";
+			/* 17 is reserved */
+		case 18:
+			return "Gaming/Toy";
+		}
+		break;
+	case 5:	/* peripheral */ {
+		static char cls_str[48]; cls_str[0] = 0;
+
+		switch (minor & 48) {
+		case 16:
+			strncpy(cls_str, "Keyboard", sizeof(cls_str));
+			break;
+		case 32:
+			strncpy(cls_str, "Pointing device", sizeof(cls_str));
+			break;
+		case 48:
+			strncpy(cls_str, "Combo keyboard/pointing device", sizeof(cls_str));
+			break;
+		}
+		if ((minor & 15) && (strlen(cls_str) > 0))
+			strcat(cls_str, "/");
+
+		switch (minor & 15) {
+		case 0:
+			break;
+		case 1:
+			strncat(cls_str, "Joystick",
+					sizeof(cls_str) - strlen(cls_str) - 1);
+			break;
+		case 2:
+			strncat(cls_str, "Gamepad",
+					sizeof(cls_str) - strlen(cls_str) - 1);
+			break;
+		case 3:
+			strncat(cls_str, "Remote control",
+					sizeof(cls_str) - strlen(cls_str) - 1);
+			break;
+		case 4:
+			strncat(cls_str, "Sensing device",
+					sizeof(cls_str) - strlen(cls_str) - 1);
+			break;
+		case 5:
+			strncat(cls_str, "Digitizer tablet",
+					sizeof(cls_str) - strlen(cls_str) - 1);
+			break;
+		case 6:
+			strncat(cls_str, "Card reader",
+					sizeof(cls_str) - strlen(cls_str) - 1);
+			break;
+		default:
+			strncat(cls_str, "(reserved)",
+					sizeof(cls_str) - strlen(cls_str) - 1);
+			break;
+		}
+		if (strlen(cls_str) > 0)
+			return cls_str;
+		break;
+	}
+	case 6:	/* imaging */
+		if (minor & 4)
+			return "Display";
+		if (minor & 8)
+			return "Camera";
+		if (minor & 16)
+			return "Scanner";
+		if (minor & 32)
+			return "Printer";
+		break;
+	case 7: /* wearable */
+		switch (minor) {
+		case 1:
+			return "Wrist Watch";
+		case 2:
+			return "Pager";
+		case 3:
+			return "Jacket";
+		case 4:
+			return "Helmet";
+		case 5:
+			return "Glasses";
+		}
+		break;
+	case 8: /* toy */
+		switch (minor) {
+		case 1:
+			return "Robot";
+		case 2:
+			return "Vehicle";
+		case 3:
+			return "Doll / Action Figure";
+		case 4:
+			return "Controller";
+		case 5:
+			return "Game";
+		}
+		break;
+	case 63:	/* uncategorised */
+		return "";
+	}
+	return "Unknown (reserved) minor device class";
+}
+
+static char *major_classes[] = {
+	"Miscellaneous", "Computer", "Phone", "LAN Access",
+	"Audio/Video", "Peripheral", "Imaging", "Uncategorized"
+};
+
+/* Remote name */
+
+
+static struct option name_options[] = {
+	{ "help",	0, 0, 'h' },
+	{ 0, 0, 0, 0 }
+};
+
+static const char *name_help =
+	"Usage:\n"
+	"\tname <bdaddr>\n";
+
+static void cmd_name(int dev_id, int argc, char **argv)
+{
+	bdaddr_t bdaddr;
+	char name[248];
+	int opt, dd;
+
+	for_each_opt(opt, name_options, NULL) {
+		switch (opt) {
+		default:
+			printf("%s", name_help);
+			return;
+		}
+	}
+	helper_arg(1, 1, &argc, &argv, name_help);
+
+	str2ba(argv[0], &bdaddr);
+
+	if (dev_id < 0) {
+		dev_id = hci_get_route(&bdaddr);
+		if (dev_id < 0) {
+			fprintf(stderr, "Device is not available.\n");
+			exit(1);
+		}
+	}
+
+	dd = hci_open_dev(dev_id);
+	if (dd < 0) {
+		perror("HCI device open failed");
+		exit(1);
+	}
+	if(iteration_count==0){
+		iteration_count=1;
+		it_flag=0;
+	}
+	while(iteration_count){
+		if (hci_read_remote_name(dd, &bdaddr, sizeof(name), name, 25000) == 0)
+		printf("%s\n", name);
+		if(it_flag!=0){
+			iteration_count--;
+		}
+	}
+
+	hci_close_dev(dd);
+}
+
+/* Info about remote device */
 
 static struct option info_options[] = {
 	{ "help",	0, 0, 'h' },
 	{ 0, 0, 0, 0 }
 };
 
-static void hcitool_info(int dev_id, int argc, char **argv){
+static const char *info_help =
+	"Usage:\n"
+	"\tinfo <bdaddr>\n";
 
+static void cmd_info(int dev_id, int argc, char **argv)
+{
 	bdaddr_t bdaddr;
 	uint16_t handle;
 	uint8_t features[8], max_page = 0;
@@ -429,14 +787,14 @@ static void hcitool_info(int dev_id, int argc, char **argv){
 	struct hci_conn_info_req *cr;
 	int i, opt, dd, cc = 0;
 
-	// for_each_opt(opt, info_options, NULL) {
-	// 	switch (opt) {
-	// 	default:
-	// 		printf("%s", info_help);
-	// 		return;
-	// 	}
-	// }
-	// helper_arg(1, 1, &argc, &argv, info_help);
+	for_each_opt(opt, info_options, NULL) {
+		switch (opt) {
+		default:
+			printf("%s", info_help);
+			return;
+		}
+	}
+	helper_arg(1, 1, &argc, &argv, info_help);
 
 	str2ba(argv[0], &bdaddr);
 
@@ -546,16 +904,97 @@ static void hcitool_info(int dev_id, int argc, char **argv){
 			features[4], features[5], features[6], features[7]);
 	}
 
-	if (cc) {
-		usleep(10000);
-		hci_disconnect(dd, handle, HCI_OE_USER_ENDED_CONNECTION, 10000);
+	if(iteration_count==0){
+		iteration_count=1;
+		it_flag=0;
 	}
-
+	while(iteration_count){
+		if (cc) {
+			usleep(10000);
+			hci_disconnect(dd, handle, HCI_OE_USER_ENDED_CONNECTION, 10000);
+		}
+		if(it_flag!=0){
+			iteration_count--;
+		}
+	}
 	hci_close_dev(dd);
 }
 
 
-/*----------------------------------------------------lecc----------------------------------------------------------------*/
+/* Create connection */
+
+static struct option cc_options[] = {
+	{ "help",	0, 0, 'h' },
+	{ "role",	1, 0, 'r' },
+	{ "ptype",	1, 0, 'p' },
+	{ 0, 0, 0, 0 }
+};
+
+static const char *cc_help =
+	"Usage:\n"
+	"\tcc [--role=c|p] [--ptype=pkt_types] <bdaddr>\n"
+	"Example:\n"
+	"\tcc --ptype=dm1,dh3,dh5 01:02:03:04:05:06\n"
+	"\tcc --role=c 01:02:03:04:05:06\n";
+
+static void cmd_cc(int dev_id, int argc, char **argv)
+{
+	bdaddr_t bdaddr;
+	uint16_t handle;
+	uint8_t role;
+	unsigned int ptype;
+	int dd, opt;
+
+	role = 0x01;
+	ptype = HCI_DM1 | HCI_DM3 | HCI_DM5 | HCI_DH1 | HCI_DH3 | HCI_DH5;
+
+	for_each_opt(opt, cc_options, NULL) {
+		switch (opt) {
+		case 'p':
+			hci_strtoptype(optarg, &ptype);
+			break;
+
+		case 'r':
+			role = optarg[0] == 'm' || optarg[0] == 'c' ? 0 : 1;
+			break;
+
+		default:
+			printf("%s", cc_help);
+			return;
+		}
+	}
+	helper_arg(1, 1, &argc, &argv, cc_help);
+
+	str2ba(argv[0], &bdaddr);
+
+	if (dev_id < 0) {
+		dev_id = hci_get_route(&bdaddr);
+		if (dev_id < 0) {
+			fprintf(stderr, "Device is not available.\n");
+			exit(1);
+		}
+	}
+
+	dd = hci_open_dev(dev_id);
+	if (dd < 0) {
+		perror("HCI device open failed");
+		exit(1);
+	}
+	if(iteration_count==0){
+		iteration_count=1;
+		it_flag=0;
+	}
+	while(iteration_count){
+		if (hci_create_connection(dd, &bdaddr, htobs(ptype),
+				htobs(0x0000), role, &handle, 25000) < 0)
+		perror("Can't create connection");
+		if(it_flag!=0){
+			iteration_count--;
+		}
+	}
+	
+	hci_close_dev(dd);
+}
 
 static struct option lecc_options[] = {
 	{ "help",	0, 0, 'h' },
@@ -566,8 +1005,14 @@ static struct option lecc_options[] = {
 	{ 0, 0, 0, 0 }
 };
 
+static const char *lecc_help =
+	"Usage:\n"
+	"\tlecc [--static] [--random] <bdaddr>\n"
+	"\tlecc --acceptlist\n";
 
-static void hcitool_lecc(int dev_id, int argc, char **argv){
+static void cmd_lecc(int dev_id, int argc, char **argv)
+{
+	printf("in cmd_lecc");
 	int err, opt, dd;
 	bdaddr_t bdaddr;
 	uint16_t interval, latency, max_ce_length, max_interval, min_ce_length;
@@ -591,11 +1036,11 @@ static void hcitool_lecc(int dev_id, int argc, char **argv){
 			initiator_filter = 0x01; /* Use accept list */
 			break;
 		default:
-	//		printf("%s", lecc_help);
+			printf("%s", lecc_help);
 			return;
 		}
 	}
-//	helper_arg(0, 1, &argc, &argv, lecc_help);
+	helper_arg(0, 1, &argc, &argv, lecc_help);
 
 	if (dev_id < 0)
 		dev_id = hci_get_route(NULL);
@@ -633,68 +1078,6 @@ static void hcitool_lecc(int dev_id, int argc, char **argv){
 	hci_close_dev(dd);
 }
 
-/*--------------------------------------------------------cc------------------------------------------------------------------*/
-
-static struct option cc_options[] = {
-	{ "help",	0, 0, 'h' },
-	{ "role",	1, 0, 'r' },
-	{ "ptype",	1, 0, 'p' },
-	{ 0, 0, 0, 0 }
-};
-
-static void hcitool_cc(int dev_id, int argc, char **argv){
-
-	bdaddr_t bdaddr;
-	uint16_t handle;
-	uint8_t role;
-	unsigned int ptype;
-	int dd, opt;
-
-	role = 0x01;
-	ptype = HCI_DM1 | HCI_DM3 | HCI_DM5 | HCI_DH1 | HCI_DH3 | HCI_DH5;
-
-	for_each_opt(opt, cc_options, NULL) {
-		switch (opt) {
-		case 'p':
-			hci_strtoptype(optarg, &ptype);
-			break;
-
-		case 'r':
-			role = optarg[0] == 'm' || optarg[0] == 'c' ? 0 : 1;
-			break;
-
-		default:
-		//	printf("%s", cc_help);
-			return;
-		}
-	}
-//	helper_arg(1, 1, &argc, &argv, cc_help);
-
-	str2ba(argv[0], &bdaddr);
-
-	if (dev_id < 0) {
-		dev_id = hci_get_route(&bdaddr);
-		if (dev_id < 0) {
-			fprintf(stderr, "Device is not available.\n");
-			exit(1);
-		}
-	}
-
-	dd = hci_open_dev(dev_id);
-	if (dd < 0) {
-		perror("HCI device open failed");
-		exit(1);
-	}
-
-	if (hci_create_connection(dd, &bdaddr, htobs(ptype),
-				htobs(0x0000), role, &handle, 25000) < 0)
-		perror("Can't create connection");
-
-	hci_close_dev(dd);
-}
-
-/*-----------------------------------------------------------leinfo--------------------------------------------------------------------*/
-
 static struct option leinfo_options[] = {
 	{ "help",	0, 0, 'h' },
 	{ "static",	0, 0, 's' },
@@ -702,9 +1085,12 @@ static struct option leinfo_options[] = {
 	{ 0, 0, 0, 0 }
 };
 
+static const char *leinfo_help =
+	"Usage:\n"
+	"\tleinfo [--static] [--random] <bdaddr>\n";
 
-static void hcitool_leinfo(int dev_id, int argc, char **argv){
-
+static void cmd_leinfo(int dev_id, int argc, char **argv)
+{
 	bdaddr_t bdaddr;
 	uint16_t handle;
 	uint8_t features[8];
@@ -726,11 +1112,11 @@ static void hcitool_leinfo(int dev_id, int argc, char **argv){
 			peer_bdaddr_type = LE_RANDOM_ADDRESS;
 			break;
 		default:
-	//		printf("%s", leinfo_help);
+			printf("%s", leinfo_help);
 			return;
 		}
 	}
-//	helper_arg(1, 1, &argc, &argv, leinfo_help);
+	helper_arg(1, 1, &argc, &argv, leinfo_help);
 
 	str2ba(argv[0], &bdaddr);
 
@@ -793,8 +1179,9 @@ static void hcitool_leinfo(int dev_id, int argc, char **argv){
 	hci_close_dev(dd);
 }
 
+/*---------------------------------------------------------main function-------------------------------------------------------------------------------*/
 
-
+/*------------------------------------------------------------------------------------------------------------------------------------------------------*/
 static void usage(void)
 {
 	printf("Bluedos Testbed\n");
@@ -853,6 +1240,7 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
+
 	if (strcmp(protocol , "l2ping") == 0 && strcmp(attack, "ping") == 0) {
 		ping(argv[optind]);
 	}
@@ -860,19 +1248,20 @@ int main(int argc, char *argv[])
 		connection(argv[optind]);
 	}
 	else if (strcmp(protocol, "hcitool") == 0 && strcmp(attack, "name") == 0) {
-		hcitool_name(dev_id, argc,argv);
+		cmd_name(dev_id, argc, argv);
 	}
+
 	else if (strcmp(protocol, "hcitool") == 0 && strcmp(attack, "info") == 0){
-		hcitool_info(dev_id, argc,argv);
+		cmd_info(dev_id, argc, argv);
 	}
 	else if (strcmp(protocol, "hcitool") == 0 && strcmp(attack, "cc") == 0) {
-		hcitool_cc(dev_id, argc,argv);
+		cmd_cc(dev_id, argc, argv);
 	}
 	else if (strcmp(protocol, "hcitool") == 0 && strcmp(attack, "lecc") == 0) {
-		hcitool_lecc(dev_id, argc,argv);
+		cmd_lecc(dev_id, argc, argv);
 	}
 	else if (strcmp(protocol,"hcitool") == 0 && strcmp(attack, "leinfo") == 0){
-		hcitool_leinfo(dev_id, argc,argv);
+		cmd_leinfo(dev_id, argc, argv);
 	}
 	else {
 		printf("invalid protocol");
