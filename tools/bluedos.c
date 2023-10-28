@@ -3,9 +3,8 @@
  *
  *  BlueZ - Bluetooth protocol stack for Linux
  *
- *  Copyright (C) 2000-2001  Qualcomm Incorporated
- *  Copyright (C) 2002-2003  Maxim Krasnyansky <maxk@qualcomm.com>
- *  Copyright (C) 2002-2010  Marcel Holtmann <marcel@holtmann.org>
+ *  Copyright (C) 2023  Poonam Shelke <shelkepoonam29@gmail.com><s.poonam@iitg.ac.in>
+ *  Copyright (C) 2023  Nitish Kalan <nk221212@gmail.com><nitismk@iitk.ac.in>
  *
  *
  */
@@ -13,9 +12,13 @@
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
-
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
 #define _GNU_SOURCE
- #include <stdio.h>
+#define LE_LINK		0x80
+#define for_each_opt(opt, long, short) while ((opt=getopt_long(argc, argv, short ? short:"+", long, NULL)) != -1)
+#include <stdio.h>
 #include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -26,20 +29,11 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
-
 #include "lib/bluetooth.h"
 #include "lib/hci.h"
 #include "lib/hci_lib.h"
 #include "lib/l2cap.h"
 #include "src/oui.h"
-
-#ifndef MIN
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#endif
-
-#define LE_LINK		0x80
-#define for_each_opt(opt, long, short) while ((opt=getopt_long(argc, argv, short ? short:"+", long, NULL)) != -1)
-
 /* Defaults */
 static bdaddr_t bdaddr;
 static int size    = 44;
@@ -52,9 +46,6 @@ static int reverse = 0;
 static int verify = 0;
 static char *protocol;
 static char *attack;
-
-//static int protocol_in= atoi()
-//static int attack_in;
 static int iteration_count = 0 ;
 
 /* Stats */
@@ -321,6 +312,7 @@ static void connection(char *svr){
 			goto error;
 		}
 		printf("Connect started\n");
+
 		if (connect(sk, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
 			perror("Can't connect");
 			//goto error;
