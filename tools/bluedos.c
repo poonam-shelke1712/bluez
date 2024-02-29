@@ -1179,9 +1179,9 @@ static void usage(void)
 	printf("Bluedos Testbed\n");
 	printf("Usage:\n");
 	printf("\tbluedos [-p protocol] [-s size] [-i iterationcount] [-a attack] [-f] <bdaddr>\n");
-	printf("\t-p  protocol type (l2ping || hcitool )\n");
+	printf("\t-p  protocol type (l2ping || hcitool)\n");
 	printf("\t-i  For number of iteration attack will be on. Default : infinite\n");
-	printf("\t-a  Attack type : l2ping [ ping , connection ] || hcitool [name , info , lecc , cc , leinfo ]\n ");
+	printf("\t-a  Attack type : l2ping [ping , connection] || hcitool [name , info , lecc , cc , leinfo]\n ");
 	printf("\t-f  Flood ping (delay = 0)\n");
 	
 }
@@ -1213,8 +1213,7 @@ int main(int argc, char *argv[])
 
 		case 'i':
 			iteration_count=atoi(optarg);
-			break;	
-	
+			break;		
 
 		case 'f':
 			/* Kinda flood ping */
